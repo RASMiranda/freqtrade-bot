@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Bash(bws:*)",
+      "Read(./user_data/data/**)",
+      "Read(./user_data/backtest_results/**)",
+      "Read(./user_data/logs/**)",
+      "Read(./**/*.sqlite)"
+    ]
+  }
+}
