@@ -1,0 +1,36 @@
+# Freqtrade dry-run bot. The image is pinned to a release tag: Dependabot bumps it, never use :stable.
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:2026.9
+    container_name: freqtrade
+    restart: unless-stopped
+    # Host side is loopback only; reach the API remotely through Tailscale.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    env_file:
+      - path: .env
+        required: false
+    command: >
+      trade
+      --config /freqtrade/user_data/config.json
+      --strategy HopperBaseline
+      --db-url sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite
+    labels:
+      - autoheal=true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/ping', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
