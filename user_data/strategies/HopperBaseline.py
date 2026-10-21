@@ -1,6 +1,6 @@
 """HopperBaseline: MAMA/FAMA cross confirmed by Parabolic SAR, 30m, spot long only."""
 
-import talib.abstract as ta
+import talib
 from freqtrade.strategy import IStrategy
 from pandas import DataFrame
 
@@ -41,10 +41,10 @@ class HopperBaseline(IStrategy):
         ]
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        mama, fama = ta.MAMA(dataframe["close"])
+        mama, fama = talib.MAMA(dataframe["close"])
         dataframe["mama"] = mama
         dataframe["fama"] = fama
-        dataframe["sar"] = ta.SAR(dataframe)
+        dataframe["sar"] = talib.SAR(dataframe["high"], dataframe["low"])
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
