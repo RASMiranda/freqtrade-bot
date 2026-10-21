@@ -300,7 +300,7 @@ cmd_doctor() {
   if docker compose version >/dev/null 2>&1; then ok "docker compose v2"; else bad "docker compose v2 missing"; fi
   arch=$(uname -m)
   case $arch in x86_64|amd64|aarch64|arm64) ok "arch $arch" ;; *) warn "arch $arch is untested" ;; esac
-  have jq && ok "jq present" || bad "jq missing"
+  if have jq; then ok "jq present"; else bad "jq missing"; fi
 
   if [ -f .env ]; then
     mode=$(stat -c %a .env 2>/dev/null || stat -f %Lp .env 2>/dev/null || echo '?')
@@ -309,8 +309,8 @@ cmd_doctor() {
     warn ".env missing (run ./setup.sh)"
   fi
   if [ "$SECRETS_BACKEND" = bws ]; then
-    have bws && ok "SECRETS_BACKEND=bws, bws installed" || bad "SECRETS_BACKEND=bws but bws is not installed"
-    [ -n "${BWS_ACCESS_TOKEN:-}" ] && ok "BWS_ACCESS_TOKEN set" || warn "BWS_ACCESS_TOKEN not set in this shell"
+    if have bws; then ok "SECRETS_BACKEND=bws, bws installed"; else bad "SECRETS_BACKEND=bws but bws is not installed"; fi
+    if [ -n "${BWS_ACCESS_TOKEN:-}" ]; then ok "BWS_ACCESS_TOKEN set"; else warn "BWS_ACCESS_TOKEN not set in this shell"; fi
   else
     ok "SECRETS_BACKEND=env"
   fi

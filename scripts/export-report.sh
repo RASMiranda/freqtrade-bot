@@ -113,6 +113,7 @@ case $REPO_URL in
   https://*) [ -n "${REPORTS_GH_TOKEN:-}" ] || die "REPORTS_GH_TOKEN is not set; report kept locally, not pushed" ;;
 esac
 export REPORTS_GH_TOKEN
+# shellcheck disable=SC2016  # $REPORTS_GH_TOKEN expands inside the helper, not here
 helper='!f() { echo username=x-access-token; echo "password=$REPORTS_GH_TOKEN"; }; f'
 gitc() { git -c credential.helper= -c "credential.helper=$helper" "$@"; }
 
