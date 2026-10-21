@@ -1,0 +1,52 @@
+# Sigma alert bands. A metric's reading is compared with its own baseline
+# (mean and stdev over `window_days`); the distance in standard deviations
+# picks the action. The weekly review and the quant-reviewer compare strategy
+# changes against these bands.
+#
+# The 3-sigma action only stops NEW entries. It never changes dry_run and it
+# never touches open trades.
+version: 1
+
+actions:
+  1:
+    name: log
+    description: Write a line to the bot log. No notification.
+  2:
+    name: telegram
+    description: Send a Telegram message.
+  3:
+    name: stop_entry
+    description: Pause new entries through the API. Open trades and dry_run are untouched.
+    api:
+      method: POST
+      endpoint: /api/v1/stopentry   # name confirmed against the pinned Freqtrade release; tests assert it
+    resume: A human restarts the bot (./bot down && ./bot up) after looking at the cause.
+
+metrics:
+  daily_profit:
+    description: Closed-trade profit per day, in percent of the stake.
+    unit: percent
+    breach_side: below      # only a shortfall alerts
+    window_days: 30
+    min_samples: 14         # below this the band is not enforced
+    baseline:               # filled from dry-run history, not guessed
+      mean: null
+      stdev: null
+  drawdown:
+    description: Peak-to-trough drawdown of the account, in percent.
+    unit: percent
+    breach_side: above
+    window_days: 30
+    min_samples: 14
+    baseline:
+      mean: null
+      stdev: null
+  trade_rate:
+    description: Number of trades opened per day.
+    unit: trades_per_day
+    breach_side: both       # a silent bot and a runaway bot both alert
+    window_days: 14
+    min_samples: 7
+    baseline:
+      mean: null
+      stdev: null
