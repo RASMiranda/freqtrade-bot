@@ -1,0 +1,23 @@
+# Secrets and local config
+.env
+
+# Reports are pushed to freqtrade-bot-data, never committed here
+reports/
+
+# Freqtrade runtime data
+user_data/data/
+user_data/backtest_results/
+user_data/logs/
+user_data/hyperopt_results/
+user_data/plot/
+user_data/notebooks/
+*.sqlite
+*.sqlite-journal
+
+# Local tooling
+.bot/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
