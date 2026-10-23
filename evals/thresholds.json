@@ -1,0 +1,6 @@
+{
+  "_comment": "Plumbing checks on SYNTHETIC fixture data (tests/data/README.md). Not a performance bar. Do not tune the strategy to pass these.",
+  "min_total_trades": 5,
+  "max_drawdown_account": 0.35,
+  "require_market_change": true
+}
