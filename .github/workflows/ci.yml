@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FEE: "0.0026" # Kraken taker fee; passed explicitly so fixture runs need no exchange call
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev tools
+        run: pip install -r requirements-dev.txt
+
+      - name: Resolve the pinned Freqtrade image
+        run: |
+          image=$(sed -n 's/^ *image: *\(freqtradeorg\/freqtrade:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1)
+          test -n "$image"
+          echo "FREQTRADE_IMAGE=$image" >> "$GITHUB_ENV"
+          docker pull "$image"
+
+      - name: dry_run check
+        run: jq -e '.dry_run == true' user_data/config.json
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest (inside the Freqtrade image, so strategy tests run)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e PYTHONUSERBASE=/tmp/pyuser -e PATH=/tmp/pyuser/bin:/home/ftuser/.local/bin:/usr/local/bin:/usr/bin:/bin \
+            -v "$PWD:/work" -w /work --entrypoint sh "$FREQTRADE_IMAGE" \
+            -c 'pip install --user -q -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider'
+
+      - name: Fixture backtest and thresholds
+        run: evals/run.sh
+
+      - name: lookahead-analysis
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD:/work" -w /work "$FREQTRADE_IMAGE" lookahead-analysis \
+            --userdir /work/user_data --config user_data/config.json --config tests/data/config.fixture.json \
+            --datadir tests/data --strategy HopperBaseline --fee "$FEE" \
+            --minimum-trade-amount 3 --targeted-trade-amount 5
