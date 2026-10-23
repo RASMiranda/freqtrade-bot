@@ -44,9 +44,10 @@ echo "== firewall"
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow OpenSSH
-# Tailscale traffic arrives on tailscale0; this is what lets `tailscale serve`
-# reach the tailnet. The API itself is still bound to 127.0.0.1 and needs its login.
-ufw allow in on tailscale0
+# `tailscale serve --bg 8080` publishes the API as HTTPS on port 443 of the
+# tailnet address, so only that port is opened, and only on tailscale0.
+# Tailscale's own UDP traffic needs no inbound rule (it connects outbound).
+ufw allow in on tailscale0 to any port 443 proto tcp
 ufw --force enable
 
 echo "== repo"
