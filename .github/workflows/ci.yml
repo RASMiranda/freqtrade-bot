@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FEE: "0.0026" # Kraken taker fee; passed explicitly so fixture runs need no exchange call
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev tools
+        run: pip install -r requirements-dev.txt
+
+      - name: Resolve the pinned Freqtrade image
+        run: |
+          image=$(sed -n 's/^ *image: *\(freqtradeorg\/freqtrade:[^ ]*\).*/\1/p' docker-compose.yml | head -n 1)
+          test -n "$image"
+          echo "FREQTRADE_IMAGE=$image" >> "$GITHUB_ENV"
+          docker pull "$image"
+
+      - name: dry_run check
+        run: jq -e '.dry_run == true' user_data/config.json
+
+      - name: ruff
+        run: ruff check .
+
+      - name: pytest (inside the Freqtrade image, so strategy tests run)
+        run: |
+          # Default image user (ftuser): freqtrade and talib live in its home, so do not override user or HOME.
+          docker run --rm -v "$PWD:/work" -w /work --entrypoint sh "$FREQTRADE_IMAGE" \
+            -c 'pip install --user -q -r requirements-dev.txt && python -m pytest -q -rs -p no:cacheprovider'
+
+      - name: Fixture backtest and thresholds
+        run: evals/run.sh
+
+      - name: lookahead-analysis
+        run: |
+          set -o pipefail
+          mkdir -p user_data/backtest_results
+          chmod a+rwx user_data/backtest_results
+          # api_server.password is required by config validation and deliberately absent from the repo;
+          # a throwaway random value is enough because nothing starts the API here.
+          docker run --rm -e FREQTRADE__API_SERVER__PASSWORD="$(openssl rand -hex 16)" \
+            -v "$PWD:/work" -w /work "$FREQTRADE_IMAGE" lookahead-analysis \
+            --userdir /work/user_data --config user_data/config.json --config tests/data/config.fixture.json \
+            --datadir tests/data --strategy HopperBaseline --fee "$FEE" \
+            --minimum-trade-amount 3 --targeted-trade-amount 5 \
+            2>&1 | tee lookahead.log
+          # freqtrade can exit 0 after a configuration error, so fail on it explicitly.
+          if grep -q "Configuration error\|CRITICAL" lookahead.log; then
+            echo "lookahead-analysis did not run (configuration error above)" >&2
+            exit 1
+          fi
