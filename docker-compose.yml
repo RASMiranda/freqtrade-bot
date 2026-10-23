@@ -12,6 +12,15 @@ services:
     env_file:
       - path: .env
         required: false
+    # Secrets reach the container from the shell environment (`bws run`) or from
+    # .env (SECRETS_BACKEND=env). Listing them here forwards whichever is set.
+    environment:
+      - FREQTRADE__API_SERVER__PASSWORD
+      - FREQTRADE__API_SERVER__JWT_SECRET_KEY
+      - FREQTRADE__EXCHANGE__KEY
+      - FREQTRADE__EXCHANGE__SECRET
+      - FREQTRADE__TELEGRAM__TOKEN
+      - FREQTRADE__TELEGRAM__CHAT_ID
     command: >
       trade
       --config /freqtrade/user_data/config.json

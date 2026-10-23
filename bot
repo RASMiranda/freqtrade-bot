@@ -1,0 +1,418 @@
+#!/bin/sh
+# freqtrade-bot CLI (POSIX sh). Run `./bot help`.
+set -eu
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+cd "$ROOT"
+
+CONTAINER=freqtrade
+SERVICE=freqtrade
+CONFIG=user_data/config.json
+STATE_DIR=.bot
+API_URL=${API_URL:-http://127.0.0.1:8080}
+
+die() { printf 'bot: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Non-secret lookups only (SECRETS_BACKEND, exchange name).
+env_file_value() {
+  [ -f .env ] || return 0
+  sed -n "s/^$1=//p" .env | tail -n 1 | tr -d '"'"'"
+}
+
+SECRETS_BACKEND=${SECRETS_BACKEND:-$(env_file_value SECRETS_BACKEND)}
+SECRETS_BACKEND=${SECRETS_BACKEND:-env}
+case $SECRETS_BACKEND in
+  env|bws) ;;
+  *) die "SECRETS_BACKEND must be env or bws (got '$SECRETS_BACKEND')" ;;
+esac
+
+# docker compose, through bws when SECRETS_BACKEND=bws. Honours the rollback override.
+dc() {
+  if [ -f "$STATE_DIR/override.yml" ]; then
+    set -- -f docker-compose.yml -f "$STATE_DIR/override.yml" "$@"
+  fi
+  if [ "$SECRETS_BACKEND" = bws ]; then
+    have bws || die "SECRETS_BACKEND=bws but bws is not installed"
+    bws run -- docker compose "$@"
+  else
+    docker compose "$@"
+  fi
+}
+
+# One-off container for backtests and downloads. autoheal must not restart it
+# (it inherits the bot's healthcheck, which cannot pass without the API).
+dc_oneoff() {
+  name=$1; shift
+  dc run --rm -T --no-deps --name "$name" --label autoheal=false "$SERVICE" "$@"
+}
+
+# ---------------------------------------------------------------- lifecycle
+
+cmd_up() { dc up -d; }
+cmd_down() { dc down; }
+cmd_logs() { dc logs -f --tail=100 "$SERVICE"; }
+
+cmd_status() {
+  dc ps
+  if curl -fsS -m 5 -o /dev/null "$API_URL/api/v1/ping" 2>/dev/null; then
+    say "api:    up ($API_URL)"
+  else
+    say "api:    down ($API_URL)"
+  fi
+  health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+  say "health: ${health:-unknown}"
+}
+
+pinned_image() {
+  docker compose -f docker-compose.yml config --images | grep '^freqtradeorg/freqtrade:' | head -n 1
+}
+
+cmd_update() {
+  mkdir -p "$STATE_DIR"
+  running=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)
+  rm -f "$STATE_DIR/override.yml"
+  target=$(pinned_image)
+  [ -n "$target" ] || die "cannot read the pinned image from docker-compose.yml"
+  # Remember what is running now, but only when this update changes it, so a
+  # repeat update does not overwrite the tag rollback needs.
+  if [ -n "$running" ] && [ "$running" != "$target" ]; then
+    printf '%s\n' "$running" > "$STATE_DIR/last-tag"
+    say "recorded previous image $running in $STATE_DIR/last-tag"
+  fi
+  say "pulling $target (run 'git pull' first to pick up a newly pinned tag)"
+  dc pull
+  dc up -d
+}
+
+cmd_rollback() {
+  [ -s "$STATE_DIR/last-tag" ] || die "no previous tag recorded in $STATE_DIR/last-tag; nothing to roll back to"
+  tag=$(head -n 1 "$STATE_DIR/last-tag")
+  case $tag in
+    ''|*[!A-Za-z0-9._:/-]*) die "unexpected content in $STATE_DIR/last-tag" ;;
+    *:stable|*:latest) die "refusing to roll back to a floating tag ($tag)" ;;
+    freqtradeorg/freqtrade:*) ;;
+    *) die "last-tag is not a freqtradeorg/freqtrade tag" ;;
+  esac
+  printf 'services:\n  %s:\n    image: %s\n' "$SERVICE" "$tag" > "$STATE_DIR/override.yml"
+  say "rolling back to $tag (override in $STATE_DIR/override.yml; ./bot update clears it)"
+  dc pull "$SERVICE"
+  dc up -d
+}
+
+# ------------------------------------------------------------------- checks
+
+cmd_test() {
+  failed=0
+  skipped=""
+
+  say "== ruff"
+  if have ruff; then ruff check . || failed=1; else say "ruff not installed"; failed=1; fi
+
+  say "== pytest"
+  if have python3 && python3 -m pytest --version >/dev/null 2>&1; then
+    rc=0
+    python3 -m pytest -q || rc=$?
+    case $rc in
+      0) ;;
+      5) say "no tests collected yet"; skipped="$skipped pytest" ;;
+      *) failed=1 ;;
+    esac
+  else
+    say "pytest not installed"; failed=1
+  fi
+
+  say "== fixture backtest eval"
+  if [ -x evals/run.sh ]; then
+    evals/run.sh || failed=1
+  else
+    say "evals/run.sh not present yet; skipped"; skipped="$skipped fixture-eval"
+  fi
+
+  say "== dry_run check"
+  if have jq && jq -e '.dry_run == true' "$CONFIG" >/dev/null; then
+    say "ok: dry_run is true in $CONFIG"
+  else
+    say "FAIL: dry_run is not true in $CONFIG (or jq missing)"; failed=1
+  fi
+
+  [ -z "$skipped" ] || say "skipped:$skipped"
+  [ "$failed" -eq 0 ] || die "test failed"
+  say "test passed"
+}
+
+cmd_backtest() {
+  [ $# -ge 1 ] || die "usage: ./bot backtest <Strategy> [timerange]"
+  strategy=$1
+  case $strategy in *[!A-Za-z0-9_]*) die "invalid strategy name" ;; esac
+  # No fee override: Freqtrade uses the exchange's real fees. The summary
+  # reports Market change (buy-and-hold) next to the result.
+  if [ $# -ge 2 ]; then
+    dc_oneoff freqtrade-backtest backtesting --config "/freqtrade/$CONFIG" --strategy "$strategy" --timerange "$2"
+  else
+    dc_oneoff freqtrade-backtest backtesting --config "/freqtrade/$CONFIG" --strategy "$strategy"
+  fi
+}
+
+# ---------------------------------------------------------------------- data
+
+exchange_name() {
+  name=$(env_file_value FREQTRADE__EXCHANGE__NAME)
+  [ -n "$name" ] || name=$(jq -r '.exchange.name' "$CONFIG")
+  printf '%s' "$name"
+}
+
+# download_args <pair-or-empty> <days>  -> runs one download-data call.
+download() {
+  pair=$1; days=$2
+  set -- download-data --config "/freqtrade/$CONFIG" --timeframes 30m --days "$days"
+  [ -z "$pair" ] || set -- "$@" --pairs "$pair"
+  # Kraken returns only 720 candles, so history comes from trades.
+  [ "$(exchange_name)" != kraken ] || set -- "$@" --dl-trades
+  dc_oneoff freqtrade-download "$@"
+}
+
+cmd_data() {
+  have jq || die "jq is required"
+  download "" "${1:-14}"
+}
+
+# ------------------------------------------------------------------- nightly
+
+# days_before <YYYY-MM-DD> <n>   (GNU date, with a BSD fallback)
+days_before() {
+  date -u -d "$1 - $2 days" +%Y-%m-%d 2>/dev/null || date -u -j -v-"$2"d -f %Y-%m-%d "$1" +%Y-%m-%d
+}
+
+# Refresh market data, then run rolling-window backtests until the time budget
+# is spent. Progress is kept in a state file so the next run resumes:
+#   dl <date> <pair>               pair refreshed on that date
+#   anchor <date>                  start of the current window cycle
+#   win <anchor> <start> <end>     window finished
+#   cycle-done <anchor>            every window of that cycle finished
+cmd_nightly() {
+  have jq || die "jq is required"
+  have timeout || die "timeout (coreutils) is required"
+  budget=${NIGHTLY_SECONDS:-7200}
+  history=${NIGHTLY_HISTORY_DAYS:-180}
+  window=${NIGHTLY_WINDOW_DAYS:-60}
+  step=${NIGHTLY_STEP_DAYS:-30}
+  dir=user_data/backtest_results/nightly
+  state=$dir/state
+  mkdir -p "$dir"
+  touch "$state"
+
+  lock=$dir/lock.d
+  mkdir "$lock" 2>/dev/null || die "another nightly run holds $lock (remove it if that run is gone)"
+  cleanup() {
+    rmdir "$lock" 2>/dev/null || true
+    docker rm -f freqtrade-download freqtrade-nightly >/dev/null 2>&1 || true
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM
+
+  deadline=$(( $(date -u +%s) + budget ))
+  remaining() { echo $(( deadline - $(date -u +%s) )); }
+  today=$(date -u +%Y-%m-%d)
+
+  seen() { grep -qxF "$1" "$state"; }
+  mark() { printf '%s\n' "$1" >> "$state"; }
+  # limited <name> <freqtrade args...>: one-off container bounded by the time left. rc 124 = out of time.
+  limited() {
+    name=$1; shift
+    left=$(remaining)
+    [ "$left" -gt 0 ] || return 124
+    rc=0
+    timeout "$left" "$ROOT/bot" _dc run --rm -T --no-deps --name "$name" --label autoheal=false "$SERVICE" "$@" || rc=$?
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    return "$rc"
+  }
+
+  say "nightly: budget ${budget}s, history ${history}d, windows ${window}d every ${step}d"
+
+  # Phase 1: data. Per-pair so a cut-off run keeps what finished.
+  all_pairs_done=1
+  for pair in $(jq -r '.exchange.pair_whitelist[]' "$CONFIG"); do
+    seen "dl $today $pair" && continue
+    say "nightly: downloading $pair"
+    args="download-data --config /freqtrade/$CONFIG --timeframes 30m --days $history --pairs $pair"
+    [ "$(exchange_name)" != kraken ] || args="$args --dl-trades"
+    rc=0
+    # shellcheck disable=SC2086
+    limited freqtrade-download $args || rc=$?
+    case $rc in
+      0) mark "dl $today $pair" ;;
+      124) say "nightly: out of time during $pair; it resumes next run"; all_pairs_done=0; break ;;
+      *) say "nightly: download of $pair failed (rc $rc)"; all_pairs_done=0 ;;
+    esac
+  done
+  if [ "$all_pairs_done" -ne 1 ]; then
+    say "nightly: data not complete, walk-forward waits for the next run"
+    return 0
+  fi
+
+  # Phase 2: rolling windows, only once the data is complete.
+  anchor=$(sed -n 's/^anchor //p' "$state" | tail -n 1)
+  if [ -z "$anchor" ] || seen "cycle-done $anchor"; then
+    anchor=$today
+    mark "anchor $anchor"
+  fi
+  count=$(( (history - window) / step + 1 ))
+  i=$(( count - 1 ))
+  while [ "$i" -ge 0 ]; do
+    end=$(days_before "$anchor" $(( i * step )))
+    start=$(days_before "$end" "$window")
+    key="win $anchor $start $end"
+    i=$(( i - 1 ))
+    seen "$key" && continue
+    left=$(remaining)
+    if [ "$left" -lt 60 ]; then
+      say "nightly: out of time; window $start..$end resumes next run"
+      return 0
+    fi
+    say "nightly: backtest $start..$end"
+    out=$dir/${anchor}_${start}_${end}.txt
+    range="$(printf '%s' "$start" | tr -d -)-$(printf '%s' "$end" | tr -d -)"
+    rc=0
+    limited freqtrade-nightly backtesting --config "/freqtrade/$CONFIG" --strategy HopperBaseline \
+      --timerange "$range" > "$out" 2>&1 || rc=$?
+    case $rc in
+      0) mark "$key"; tail -n 25 "$out" ;;
+      124) say "nightly: out of time during $start..$end; it resumes next run"; return 0 ;;
+      *) die "backtest $start..$end failed (rc $rc), see $out" ;;
+    esac
+  done
+  mark "cycle-done $anchor"
+  say "nightly: cycle $anchor complete; results in $dir"
+}
+
+# ------------------------------------------------------------------- doctor
+
+cmd_doctor() {
+  fails=0
+  ok() { printf '[ok]   %s\n' "$*"; }
+  warn() { printf '[warn] %s\n' "$*"; }
+  bad() { printf '[FAIL] %s\n' "$*"; fails=$((fails + 1)); }
+
+  # Paste-safe: reports presence and state only, never values from .env.
+  if have docker && docker info >/dev/null 2>&1; then ok "docker daemon reachable"; else bad "docker missing or daemon not reachable"; fi
+  if docker compose version >/dev/null 2>&1; then ok "docker compose v2"; else bad "docker compose v2 missing"; fi
+  arch=$(uname -m)
+  case $arch in x86_64|amd64|aarch64|arm64) ok "arch $arch" ;; *) warn "arch $arch is untested" ;; esac
+  if have jq; then ok "jq present"; else bad "jq missing"; fi
+
+  if [ -f .env ]; then
+    mode=$(stat -c %a .env 2>/dev/null || stat -f %Lp .env 2>/dev/null || echo '?')
+    if [ "$mode" = 600 ]; then ok ".env present (mode 600)"; else warn ".env present, mode $mode (expected 600)"; fi
+  else
+    warn ".env missing (run ./setup.sh)"
+  fi
+  if [ "$SECRETS_BACKEND" = bws ]; then
+    if have bws; then ok "SECRETS_BACKEND=bws, bws installed"; else bad "SECRETS_BACKEND=bws but bws is not installed"; fi
+    if [ -n "${BWS_ACCESS_TOKEN:-}" ]; then ok "BWS_ACCESS_TOKEN set"; else warn "BWS_ACCESS_TOKEN not set in this shell"; fi
+  else
+    ok "SECRETS_BACKEND=env"
+  fi
+
+  if have jq && jq -e '.dry_run == true' "$CONFIG" >/dev/null 2>&1; then
+    ok "dry_run is true in $CONFIG"
+  else
+    bad "dry_run is not true in $CONFIG"
+  fi
+  if [ -f .env ] && grep -qi '^FREQTRADE__DRY_RUN=' .env; then
+    warn ".env overrides the dry-run switch; confirm that is intended"
+  fi
+
+  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    ports=$(docker port "$CONTAINER" 8080 2>/dev/null || true)
+    if [ -z "$ports" ]; then
+      warn "API port 8080 not published"
+    elif printf '%s\n' "$ports" | grep -qv '^127\.0\.0\.1:'; then
+      bad "API is published beyond loopback: $ports"
+    else
+      ok "API bound to 127.0.0.1 only"
+    fi
+    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+    case $health in
+      healthy) ok "container healthy" ;;
+      starting) warn "container still starting" ;;
+      *) bad "container health: ${health:-none}" ;;
+    esac
+    if curl -fsS -m 5 -o /dev/null "$API_URL/api/v1/ping" 2>/dev/null; then ok "API ping"; else bad "API ping failed"; fi
+  else
+    warn "container $CONTAINER not created (./bot up)"
+    if docker compose -f docker-compose.yml config 2>/dev/null | grep -q 'host_ip: 127.0.0.1'; then
+      ok "compose maps the API to 127.0.0.1"
+    else
+      bad "compose does not map the API to 127.0.0.1"
+    fi
+  fi
+
+  free_kb=$(df -Pk user_data 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ -z "$free_kb" ]; then
+    warn "disk: could not read free space"
+  elif [ "$free_kb" -lt 204800 ]; then
+    bad "disk: only $((free_kb / 1024)) MB free"
+  elif [ "$free_kb" -lt 1048576 ]; then
+    warn "disk: $((free_kb / 1024)) MB free"
+  else
+    ok "disk: $((free_kb / 1024)) MB free"
+  fi
+
+  if have tailscale; then
+    if tailscale status >/dev/null 2>&1; then ok "tailscale up"; else warn "tailscale installed but not up"; fi
+  else
+    warn "tailscale not installed (needed for remote access on the VM)"
+  fi
+
+  [ "$fails" -eq 0 ] || { say "doctor: $fails problem(s)"; exit 1; }
+  say "doctor: no problems"
+}
+
+# --------------------------------------------------------------------- main
+
+usage() {
+  cat <<'EOF'
+usage: ./bot <command>
+
+  up | down | logs | status      run and inspect the bot
+  update                         pull the pinned image, remember the previous tag, recreate
+  rollback                       restore the tag recorded by the last update
+  nightly                        refresh data + rolling backtests (~2h, resumes where it stopped)
+  doctor                         environment and safety checks (safe to paste in an issue)
+  test                           ruff, pytest, fixture backtest eval, dry_run check
+  backtest <Strategy> [range]    backtest with real exchange fees, e.g. 20260101-20260301
+
+helpers:
+  data [days]                    download candle history (Kraken: from trades)
+  run <command...>               run a command under the secrets backend (used by cron)
+EOF
+}
+
+cmd=${1:-help}
+[ $# -eq 0 ] || shift
+case $cmd in
+  up) cmd_up ;;
+  down) cmd_down ;;
+  logs) cmd_logs ;;
+  status) cmd_status ;;
+  update) cmd_update ;;
+  rollback) cmd_rollback ;;
+  nightly) cmd_nightly ;;
+  doctor) cmd_doctor ;;
+  test) cmd_test ;;
+  backtest) cmd_backtest "$@" ;;
+  data) cmd_data "$@" ;;
+  run)
+    [ $# -ge 1 ] || die "usage: ./bot run <command...>"
+    if [ "$SECRETS_BACKEND" = bws ]; then
+      have bws || die "SECRETS_BACKEND=bws but bws is not installed"
+      exec bws run -- "$@"
+    fi
+    exec "$@"
+    ;;
+  _dc) dc "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
