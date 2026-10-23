@@ -15,10 +15,12 @@ command -v docker >/dev/null 2>&1 || { echo "evals: docker is required" >&2; exi
 
 RESULTS=user_data/backtest_results
 mkdir -p "$RESULTS"
+# The image runs as its own user (ftuser), not as the caller, so it must be able to write here.
+chmod a+rwx "$RESULTS"
 rm -f "$RESULTS/.last_result.json"
 
 echo "evals: backtesting $STRATEGY on tests/data with $IMAGE (fee $FEE)"
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+docker run --rm \
   -v "$ROOT:/work" -w /work "$IMAGE" backtesting \
   --userdir /work/user_data --config user_data/config.json --config tests/data/config.fixture.json \
   --datadir tests/data --strategy "$STRATEGY" --fee "$FEE" --export trades
