@@ -1,0 +1,7 @@
+{
+  "datadir": "tests/data",
+  "dataformat_ohlcv": "json",
+  "exchange": {
+    "pair_whitelist": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+  }
+}
