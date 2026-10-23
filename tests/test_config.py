@@ -100,7 +100,7 @@ def test_bands_stop_entry_endpoint(root):
 
 
 def test_stopentry_exists_in_pinned_freqtrade():
-    api = pytest.importorskip("freqtrade.rpc.api_server.api_v1")
+    api = pytest.importorskip("freqtrade.rpc.api_server.api_trading")
     import inspect
 
     assert '"/stopentry"' in inspect.getsource(api)
