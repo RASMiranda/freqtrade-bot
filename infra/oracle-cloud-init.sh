@@ -2,8 +2,8 @@
 # Oracle Cloud Always Free (Ubuntu, arm64) first-boot script. Paste it as the
 # instance's cloud-init user data, or run it once as root.
 #
-# Installs Docker and Tailscale, clones the repo, runs setup.sh, installs cron
-# for heartbeat / nightly / report, and sets ufw to deny all inbound except SSH.
+# Installs Docker and Tailscale, clones the repo, installs cron for heartbeat /
+# nightly / report, and sets ufw to deny all inbound except SSH.
 # The bot API stays on 127.0.0.1; remote access is `tailscale serve`.
 #
 # Optional environment:
@@ -11,13 +11,15 @@
 #   BOT_USER       Linux user that runs the bot (default: ubuntu)
 #   TS_AUTHKEY     Tailscale auth key. Passed in the environment, never committed.
 #                  Without it, run `sudo tailscale up` and `tailscale serve --bg 8080` by hand.
-#   SECRETS_BACKEND  env (default) or bws. With bws, run ./setup.sh yourself over SSH,
-#                  because it prints the generated secrets once, to a terminal.
+#   SECRETS_BACKEND  env (default) or bws. env: this script runs setup.sh. bws: it does not,
+#                  because setup.sh prints the generated secrets once and needs a terminal;
+#                  SSH in and run ./setup.sh yourself.
 set -euo pipefail
 
 REPO_URL=${REPO_URL:-https://github.com/RASMiranda/freqtrade-bot.git}
 BOT_USER=${BOT_USER:-ubuntu}
 SECRETS_BACKEND=${SECRETS_BACKEND:-env}
+case $SECRETS_BACKEND in env|bws) ;; *) echo "SECRETS_BACKEND must be env or bws" >&2; exit 1 ;; esac
 APP_DIR=/home/$BOT_USER/freqtrade-bot
 CRON_ENV=/etc/freqtrade-bot/cron.env
 
@@ -56,7 +58,8 @@ echo "== setup"
 if [ "$SECRETS_BACKEND" = env ]; then
   sudo -u "$BOT_USER" -H sh -c "cd '$APP_DIR' && SETUP_DATA=skip ./setup.sh"
 else
-  echo "SECRETS_BACKEND=bws: log in over SSH and run: cd $APP_DIR && SECRETS_BACKEND=bws ./setup.sh"
+  echo "SECRETS_BACKEND=bws: setup.sh not run (it needs a terminal to show the secrets once)."
+  echo "SSH in and run ./setup.sh:  cd $APP_DIR && SECRETS_BACKEND=bws ./setup.sh"
 fi
 
 echo "== cron"
