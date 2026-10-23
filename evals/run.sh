@@ -19,11 +19,18 @@ mkdir -p "$RESULTS"
 chmod a+rwx "$RESULTS"
 rm -f "$RESULTS/.last_result.json"
 
+# Config validation requires api_server.password, which the committed config rightly omits.
+# Backtesting never starts the API, so a throwaway random value for this one container is enough.
+FIXTURE_PW=$(python3 -I -c 'import secrets; print(secrets.token_hex(16))')
+
 echo "evals: backtesting $STRATEGY on tests/data with $IMAGE (fee $FEE)"
-docker run --rm \
+docker run --rm -e FREQTRADE__API_SERVER__PASSWORD="$FIXTURE_PW" \
   -v "$ROOT:/work" -w /work "$IMAGE" backtesting \
   --userdir /work/user_data --config user_data/config.json --config tests/data/config.fixture.json \
   --datadir tests/data --strategy "$STRATEGY" --fee "$FEE" --export trades
+
+# freqtrade can exit 0 after logging a configuration error, so check for a result explicitly.
+[ -f "$RESULTS/.last_result.json" ] || { echo "evals: FAIL: the backtest wrote no result (see the freqtrade log above)" >&2; exit 1; }
 
 python3 -I - "$RESULTS" "$STRATEGY" evals/thresholds.json <<'PY'
 import json
